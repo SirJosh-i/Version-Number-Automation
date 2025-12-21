@@ -4,10 +4,15 @@ on:
   push:
     branches:
       - "**"
+      
+permissions:
+  contents: write   # <-- THIS FIXES THE 403
+
 
 jobs:
   versioning:
     runs-on: ubuntu-latest
+    
 
     steps:
       - name: Checkout repository
