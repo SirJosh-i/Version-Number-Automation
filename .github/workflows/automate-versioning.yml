@@ -8,80 +8,125 @@ on:
 permissions:
   contents: write   # <-- THIS FIXES THE 403
 
-
 jobs:
   versioning:
     runs-on: ubuntu-latest
-    
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # required to read tags
-
-      - name: Get latest tag
-        id: get_tag
-        run: |
-          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
-
-      - name: Read commit message
-        id: commit_msg
-        run: |
-          COMMIT_MSG=$(git log -1 --pretty=%B)
-          echo "commit_msg<<EOF" >> $GITHUB_OUTPUT
-          echo "$COMMIT_MSG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Calculate next version
-        id: version
-        run: |
-          TAG=${{ steps.get_tag.outputs.latest_tag }}
-          MSG="${{ steps.commit_msg.outputs.commit_msg }}"
-
-          VERSION=${TAG#v}
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-
-          if [[ "$MSG" == MINOR:* ]]; then
-            PATCH=$((PATCH + 1))
-          elif [[ "$MSG" == MAJOR:* ]]; then
-            MINOR=$((MINOR + 1))
-            PATCH=0
-          else
-            echo "No version bump keyword found. Skipping."
-            echo "skip=true" >> $GITHUB_OUTPUT
-            exit 0
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Detect branch
+      id: branch
+      run: |
+        BRANCH="${GITHUB_REF#refs/heads/}"
+        echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+        echo "Detected branch: $BRANCH"
+    
+    - name: Get latest tag based on branch
+      id: get_tag
+      run: |
+        BRANCH=${{ steps.branch.outputs.branch }}
+        
+        if [[ "$BRANCH" == "test" || "$BRANCH" == "test/main" ]]; then
+          TAG=$(git tag -l "test-*" --sort=-v:refname | head -n 1 || echo "")
+          if [ -z "$TAG" ]; then
+            TAG="test-0.0.0"
           fi
+          VERSION=${TAG#test-}
+          PREFIX="test"
+        elif [[ "$BRANCH" == "stage" || "$BRANCH" == "staging" ]]; then
+          TAG=$(git tag -l "staging-*" --sort=-v:refname | head -n 1 || echo "")
+          if [ -z "$TAG" ]; then
+            TAG="staging-0.0.0"
+          fi
+          VERSION=${TAG#staging-}
+          PREFIX="staging"
+        elif [[ "$BRANCH" == "main" ]]; then
+          TAG=$(git tag -l --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || echo "")
+          if [ -z "$TAG" ]; then
+            TAG="0.0.0"
+          fi
+          VERSION="$TAG"
+          PREFIX=""
+        else
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        echo "latest_tag=$TAG" >> $GITHUB_OUTPUT
+        echo "latest_version=$VERSION" >> $GITHUB_OUTPUT
+        echo "prefix=$PREFIX" >> $GITHUB_OUTPUT
+        echo "Latest tag: $TAG"
+    
+    # ------------------ NEW STEP ------------------
+    - name: Detect bump type from commit messages
+      id: bump
+      if: steps.get_tag.outputs.skip != 'true'
+      run: |
+        LATEST_TAG=${{ steps.get_tag.outputs.latest_tag }}
 
-          NEW_VERSION="v$MAJOR.$MINOR.$PATCH"
-          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        # Collect all commit messages since the last tag
+        COMMITS=$(git log "$LATEST_TAG"..HEAD --pretty=format:"%s")
+        echo "Commits since $LATEST_TAG:"
+        echo "$COMMITS"
 
-      # ------------------ TESTING ------------------
-      - name: Run tests
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          echo "Running tests..."
-          # Example:
-          # npm install
-          # npm test
-          echo "Tests passed"
-
-      # ------------------ HEALTH CHECK ------------------
-      - name: Health check
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          echo "Running health check..."
-          # Example for HTTP service:
-          # curl -f http://localhost:8080/health || exit 1
-          echo "Health check passed"
-
-      # ------------------ TAGGING ------------------
-      - name: Create and push git tag
-        if: steps.version.outputs.skip != 'true'
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git tag ${{ steps.version.outputs.new_version }}
-          git push origin ${{ steps.version.outputs.new_version }}
+        # Check in priority order: PHASE > MAJOR > MINOR
+        if echo "$COMMITS" | grep -qw "PHASE"; then
+          echo "bump=phase" >> $GITHUB_OUTPUT
+          echo "Bump type: PHASE"
+        elif echo "$COMMITS" | grep -qw "MAJOR"; then
+          echo "bump=major" >> $GITHUB_OUTPUT
+          echo "Bump type: MAJOR"
+        elif echo "$COMMITS" | grep -qw "MINOR"; then
+          echo "bump=minor" >> $GITHUB_OUTPUT
+          echo "Bump type: MINOR"
+        else
+          echo "No recognised bump keyword found — skipping"
+          echo "skip=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Calculate next version
+      id: version
+      if: steps.bump.outputs.skip != 'true' && steps.get_tag.outputs.skip != 'true'
+      run: |
+        VERSION=${{ steps.get_tag.outputs.latest_version }}
+        PREFIX=${{ steps.get_tag.outputs.prefix }}
+        BUMP=${{ steps.bump.outputs.bump }}
+        IFS='.' read -r PHASE MAJOR MINOR <<< "$VERSION"
+        
+        if [[ "$BUMP" == "phase" ]]; then
+          PHASE=$((PHASE + 1))
+          MAJOR=0
+          MINOR=0
+        elif [[ "$BUMP" == "major" ]]; then
+          MAJOR=$((MAJOR + 1))
+          MINOR=0
+        elif [[ "$BUMP" == "minor" ]]; then
+          MINOR=$((MINOR + 1))
+        else
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        if [ -z "$PREFIX" ]; then
+          NEW_VERSION="$PHASE.$MAJOR.$MINOR"
+        else
+          NEW_VERSION="$PREFIX-$PHASE.$MAJOR.$MINOR"
+        fi
+        
+        echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "Next version: $NEW_VERSION"
+    
+    # ------------------ TAGGING ------------------
+    - name: Create and push git tag
+      if: steps.version.outputs.skip != 'true' && steps.bump.outputs.skip != 'true' && steps.get_tag.outputs.skip != 'true'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag ${{ steps.version.outputs.new_version }}
+        git push origin ${{ steps.version.outputs.new_version }}
+        echo "Created and pushed tag: ${{ steps.version.outputs.new_version }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
